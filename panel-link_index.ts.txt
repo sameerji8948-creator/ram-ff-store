@@ -1,0 +1,56 @@
+// Issues a private 2-minute link for an APPROVED panel order, then forwards to the MediaFire page.
+// Deploy with:  supabase functions deploy panel-link --no-verify-jwt
+// (the GET redirect is opened by the browser without an auth header; POST is verified below)
+import { createClient } from "npm:@supabase/supabase-js@2"
+
+const siteUrl = (Deno.env.get("SITE_URL") ?? "").replace(/\/$/, "")
+const TTL_MS = 2 * 60 * 1000
+const cors = {
+  "Access-Control-Allow-Origin": siteUrl,
+  "Vary": "Origin",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+}
+const mediafireOk = (u: string) => /^https:\/\/(www\.)?mediafire\.com\//i.test(u)
+const json = (b: unknown, status = 200) => Response.json(b, { status, headers: cors })
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: cors })
+  const supabaseUrl = Deno.env.get("SUPABASE_URL")!
+  const admin = createClient(supabaseUrl, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false, autoRefreshToken: false } })
+  const url = new URL(req.url)
+
+  // Step 2: buyer opens the private link -> forward to MediaFire only while token is valid.
+  if (req.method === "GET") {
+    const back = (q: string) => Response.redirect(`${siteUrl}/?panel=${q}`, 302)
+    const t = url.searchParams.get("t") ?? ""
+    if (!/^[a-f0-9]{48}$/.test(t)) return back("expired")
+    const { data: tk } = await admin.from("apk_download_tokens").select("order_id, expires_at").eq("token", t).maybeSingle()
+    if (!tk || new Date(tk.expires_at).getTime() < Date.now()) return back("expired")
+    const { data: o } = await admin.from("apk_orders").select("status, apk_products(download_url)").eq("id", tk.order_id).maybeSingle()
+    const link = (o as any)?.apk_products?.download_url as string | undefined
+    if (!o || o.status !== "approved" || !link || !mediafireOk(link)) return back("expired")
+    return new Response(null, { status: 302, headers: { Location: link, "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" } })
+  }
+
+  // Step 1: signed-in buyer asks for a fresh link for their own approved order.
+  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405)
+  const authHeader = req.headers.get("Authorization")
+  if (!authHeader?.startsWith("Bearer ")) return json({ error: "Authentication required" }, 401)
+  const userClient = createClient(supabaseUrl, Deno.env.get("SUPABASE_ANON_KEY")!, { global: { headers: { Authorization: authHeader } } })
+  const { data: u, error: ue } = await userClient.auth.getUser()
+  if (ue || !u.user) return json({ error: "Invalid session" }, 401)
+  const { orderId } = await req.json().catch(() => ({}))
+  if (typeof orderId !== "string" || orderId.length < 10) return json({ error: "Invalid order" }, 400)
+
+  const { data: order } = await admin.from("apk_orders").select("id, status, buyer_id").eq("id", orderId).maybeSingle()
+  if (!order || order.buyer_id !== u.user.id) return json({ error: "Order not found" }, 404)
+  if (order.status !== "approved") return json({ error: "Payment not verified yet" }, 403)
+
+  await admin.from("apk_download_tokens").delete().lt("expires_at", new Date(Date.now() - 3600_000).toISOString())
+  const bytes = crypto.getRandomValues(new Uint8Array(24))
+  const token = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")
+  const { error: ie } = await admin.from("apk_download_tokens").insert({ token, order_id: orderId, expires_at: new Date(Date.now() + TTL_MS).toISOString() })
+  if (ie) return json({ error: "Could not create link" }, 500)
+  return json({ url: `${supabaseUrl}/functions/v1/panel-link?t=${token}`, expiresInSeconds: TTL_MS / 1000 })
+})

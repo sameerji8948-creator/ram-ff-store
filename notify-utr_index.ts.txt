@@ -1,0 +1,111 @@
+import { createClient } from "npm:@supabase/supabase-js@2"
+
+const allowedOrigin = Deno.env.get("SITE_URL") ?? ""
+const corsHeaders = {
+  "Access-Control-Allow-Origin": allowedOrigin,
+  "Vary": "Origin",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+}
+
+Deno.serve(async (req: Request) => {
+  const origin = req.headers.get("Origin") ?? ""
+  if (allowedOrigin && origin && origin !== allowedOrigin) {
+    return Response.json({ error: "Origin not allowed" }, { status: 403 })
+  }
+  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders })
+  if (req.method !== "POST") return Response.json({ error: "Method not allowed" }, { status: 405, headers: corsHeaders })
+
+  try {
+    const authHeader = req.headers.get("Authorization")
+    if (!authHeader?.startsWith("Bearer ")) {
+      return Response.json({ error: "Authentication required" }, { status: 401, headers: corsHeaders })
+    }
+
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!
+    const anonKey = Deno.env.get("SUPABASE_ANON_KEY")!
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    const botToken = Deno.env.get("TELEGRAM_BOT_TOKEN")
+    const adminChatId = Deno.env.get("TELEGRAM_ADMIN_CHAT_ID")
+    if (!botToken || !adminChatId) {
+      return Response.json({ error: "Telegram server secrets are not configured" }, { status: 503, headers: corsHeaders })
+    }
+
+    const userClient = createClient(supabaseUrl, anonKey, { global: { headers: { Authorization: authHeader } } })
+    const { data: userData, error: userError } = await userClient.auth.getUser()
+    if (userError || !userData.user) {
+      return Response.json({ error: "Invalid session" }, { status: 401, headers: corsHeaders })
+    }
+
+    const { recordId } = await req.json()
+    if (typeof recordId !== "string" || recordId.length < 10 || recordId.length > 100) {
+      return Response.json({ error: "Invalid order reference" }, { status: 400, headers: corsHeaders })
+    }
+
+    const adminClient = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false, autoRefreshToken: false } })
+    const { data: record, error: recordError } = await adminClient
+      .from("app_records")
+      .select("id, owner_id, value")
+      .eq("id", recordId)
+      .eq("collection", "orders")
+      .eq("owner_id", userData.user.id)
+      .maybeSingle()
+
+    if (recordError || !record) {
+      return Response.json({ error: "Order not found for this account" }, { status: 404, headers: corsHeaders })
+    }
+
+    const order = record.value as Record<string, unknown>
+    const utr = String(order.transactionId ?? "").trim()
+    if (utr.length < 6 || utr.length > 80) {
+      return Response.json({ error: "Order does not contain a valid UTR" }, { status: 400, headers: corsHeaders })
+    }
+    if (order.status !== "pending_verification") {
+      return Response.json({ error: "Only pending UTR submissions can be notified" }, { status: 409, headers: corsHeaders })
+    }
+
+    const { error: logError } = await adminClient
+      .from("utr_notification_log")
+      .insert({ order_record_id: record.id })
+    if (logError?.code === "23505") {
+      return Response.json({ sent: true, duplicate: true }, { headers: corsHeaders })
+    }
+    if (logError) throw logError
+
+    const message = [
+      "NEW UPI PAYMENT / UTR SUBMISSION",
+      `Order: ${String(order.id ?? record.id)}`,
+      `Amount: INR ${String(order.price ?? "N/A")}`,
+      `UTR: ${utr}`,
+      `Buyer: ${String(order.buyer ?? "N/A")}`,
+      `Buyer email: ${String(order.buyerEmail ?? userData.user.email ?? "N/A")}`,
+      `Seller: ${String(order.seller ?? "N/A")}`,
+      `Status: ${String(order.status ?? "pending_verification")}`,
+      "Action: Verify payment in your UPI/bank app before approving the order.",
+    ].join("\n")
+
+    let telegramResponse: Response
+    let telegramResult: Record<string, unknown>
+    try {
+      telegramResponse = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: adminChatId, text: message, disable_web_page_preview: true }),
+      })
+      telegramResult = await telegramResponse.json()
+    } catch (sendError) {
+      await adminClient.from("utr_notification_log").delete().eq("order_record_id", record.id)
+      throw sendError
+    }
+    if (!telegramResponse.ok || !telegramResult.ok) {
+      await adminClient.from("utr_notification_log").delete().eq("order_record_id", record.id)
+      console.error("Telegram send failed", telegramResult)
+      return Response.json({ error: "Telegram notification failed" }, { status: 502, headers: corsHeaders })
+    }
+
+    return Response.json({ sent: true }, { headers: corsHeaders })
+  } catch (error) {
+    console.error("notify-utr error", error)
+    return Response.json({ error: "Unable to send payment notification" }, { status: 500, headers: corsHeaders })
+  }
+})
